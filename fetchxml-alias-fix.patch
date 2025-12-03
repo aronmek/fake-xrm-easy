@@ -1,0 +1,289 @@
+From bab549b6f3bd39162d3168c161d51ac7ad7ae76b Mon Sep 17 00:00:00 2001
+From: GitHub Copilot Agent <copilot-agent@github.com>
+Date: Tue, 2 Dec 2025 22:26:46 +0000
+Subject: [PATCH] Fix FetchXML condition entityname alias resolution
+
+- Add ResolveAliasToEntityName method to resolve alias to actual entity name
+- Update ToConditionExpression to use resolved entity name for type lookup
+- Add comprehensive tests for entityname alias scenarios
+- All existing tests continue to pass
+---
+ .../Extensions/XmlExtensionsForFetchXml.cs    |  80 +++++++++-
+ .../FetchXml/FetchXmlAliasedConditionTests.cs | 149 ++++++++++++++++++
+ 2 files changed, 225 insertions(+), 4 deletions(-)
+ create mode 100644 tests/FakeXrmEasy.Core.Tests/Query/FetchXml/FetchXmlAliasedConditionTests.cs
+
+diff --git a/src/FakeXrmEasy.Core/Extensions/XmlExtensionsForFetchXml.cs b/src/FakeXrmEasy.Core/Extensions/XmlExtensionsForFetchXml.cs
+index e4104db8..4cbdce2e 100644
+--- a/src/FakeXrmEasy.Core/Extensions/XmlExtensionsForFetchXml.cs
++++ b/src/FakeXrmEasy.Core/Extensions/XmlExtensionsForFetchXml.cs
+@@ -354,6 +354,67 @@ namespace FakeXrmEasy.Extensions.FetchXml
+             return null;
+         }
+ 
++        /// <summary>
++        /// Resolves an alias to the actual entity name by finding the link-entity with the matching alias
++        /// </summary>
++        /// <param name="el">The current element (typically a condition element)</param>
++        /// <param name="alias">The alias to resolve</param>
++        /// <returns>The entity name for the link-entity with the given alias, or null if not found</returns>
++        public static string ResolveAliasToEntityName(this XElement el, string alias)
++        {
++            if (string.IsNullOrWhiteSpace(alias))
++            {
++                return null;
++            }
++
++            // Traverse up to find the root fetch element
++            var current = el;
++            while (current != null && !current.Name.LocalName.Equals("fetch"))
++            {
++                current = current.Parent;
++            }
++
++            if (current == null)
++            {
++                return null;
++            }
++
++            // Search for link-entity with matching alias
++            var linkEntity = current.Descendants()
++                .Where(e => e.Name.LocalName.Equals("link-entity"))
++                .FirstOrDefault(e =>
++                {
++                    var aliasAttr = e.GetAttribute("alias");
++                    return aliasAttr != null && aliasAttr.Value.Equals(alias, StringComparison.InvariantCultureIgnoreCase);
++                });
++
++            if (linkEntity != null)
++            {
++                var nameAttr = linkEntity.GetAttribute("name");
++                if (nameAttr != null)
++                {
++                    return nameAttr.Value;
++                }
++            }
++
++            // If alias doesn't match any link-entity, it might be the entity name itself (no alias case)
++            // Check if alias matches a link-entity name directly
++            var linkEntityByName = current.Descendants()
++                .Where(e => e.Name.LocalName.Equals("link-entity"))
++                .FirstOrDefault(e =>
++                {
++                    var nameAttr = e.GetAttribute("name");
++                    return nameAttr != null && nameAttr.Value.Equals(alias, StringComparison.InvariantCultureIgnoreCase);
++                });
++
++            if (linkEntityByName != null)
++            {
++                return alias;
++            }
++
++            return null;
++        }
++
+         /// <summary>
+         /// Extracts the JoinOperator from the current link-entity node
+         /// </summary>
+@@ -800,12 +861,23 @@ namespace FakeXrmEasy.Extensions.FetchXml
+ 
+ 
+             var entityName = GetAssociatedEntityNameForConditionExpression(elem);
++            
++            // When entityname is specified (alias or entity name), resolve it to the actual entity name for type lookup
++            var entityNameForTypeLookup = entityName;
++            if (!string.IsNullOrWhiteSpace(conditionEntityName))
++            {
++                var resolvedEntityName = elem.ResolveAliasToEntityName(conditionEntityName);
++                if (!string.IsNullOrWhiteSpace(resolvedEntityName))
++                {
++                    entityNameForTypeLookup = resolvedEntityName;
++                }
++            }
+ 
+             //Find values inside the condition expression, if apply
+             values = elem
+                         .Elements() //child nodes of this filter
+                         .Where(el => el.Name.LocalName.Equals("value"))
+-                        .Select(el => el.ToValue(ctx, entityName, attributeName, op))
++                        .Select(el => el.ToValue(ctx, entityNameForTypeLookup, attributeName, op))
+                         .ToArray();
+ 
+ 
+@@ -815,15 +887,15 @@ namespace FakeXrmEasy.Extensions.FetchXml
+ #if FAKE_XRM_EASY_2013 || FAKE_XRM_EASY_2015 || FAKE_XRM_EASY_2016 || FAKE_XRM_EASY_365 || FAKE_XRM_EASY_9
+                 if (string.IsNullOrWhiteSpace(conditionEntityName))
+                 {
+-                    return new ConditionExpression(attributeName, op, GetConditionExpressionValueCast(value, ctx, entityName, attributeName, op));
++                    return new ConditionExpression(attributeName, op, GetConditionExpressionValueCast(value, ctx, entityNameForTypeLookup, attributeName, op));
+                 }
+                 else
+                 {
+-                    return new ConditionExpression(conditionEntityName, attributeName, op, GetConditionExpressionValueCast(value, ctx, entityName, attributeName, op));
++                    return new ConditionExpression(conditionEntityName, attributeName, op, GetConditionExpressionValueCast(value, ctx, entityNameForTypeLookup, attributeName, op));
+                 }
+ 
+ #else
+-                return new ConditionExpression(attributeName, op, GetConditionExpressionValueCast(value, ctx, entityName, attributeName, op));
++                return new ConditionExpression(attributeName, op, GetConditionExpressionValueCast(value, ctx, entityNameForTypeLookup, attributeName, op));
+            
+ #endif
+             }
+diff --git a/tests/FakeXrmEasy.Core.Tests/Query/FetchXml/FetchXmlAliasedConditionTests.cs b/tests/FakeXrmEasy.Core.Tests/Query/FetchXml/FetchXmlAliasedConditionTests.cs
+new file mode 100644
+index 00000000..4467da22
+--- /dev/null
++++ b/tests/FakeXrmEasy.Core.Tests/Query/FetchXml/FetchXmlAliasedConditionTests.cs
+@@ -0,0 +1,149 @@
++using Crm;
++using Microsoft.Xrm.Sdk;
++using Microsoft.Xrm.Sdk.Query;
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Reflection;
++using Xunit;
++using FakeXrmEasy.Abstractions;
++using FakeXrmEasy.Middleware;
++using FakeXrmEasy.Middleware.Crud;
++using FakeXrmEasy.Abstractions.Enums;
++
++namespace FakeXrmEasy.Core.Tests.Query.FetchXml
++{
++    /// <summary>
++    /// Tests for FetchXML conditions with entityname attribute that references linked entity aliases
++    /// </summary>
++    public class FetchXmlAliasedConditionTests : FakeXrmEasyTestsBase
++    {
++        public FetchXmlAliasedConditionTests() : base()
++        {
++        }
++
++        /// <summary>
++        /// This test reproduces the bug where a FetchXML condition with entityname="alias"
++        /// fails when the attribute doesn't exist on the main entity but does exist on the linked entity.
++        /// 
++        /// The bug occurs because the attribute type lookup uses the parent entity name instead of
++        /// resolving the alias to the linked entity's name.
++        /// </summary>
++        [Fact]
++        public void FetchXml_WithEntityNameAlias_ShouldFilterOnLinkedEntity_NotMainEntity()
++        {
++            // This test uses Contact and Account entities from GeneratedCode.cs
++            // Contact will have an attribute that Account doesn't have
++            _context.EnableProxyTypes(Assembly.GetAssembly(typeof(Contact)));
++
++            // Create test data
++            var accountId = Guid.NewGuid();
++            var account = new Account
++            {
++                Id = accountId,
++                Name = "Test Account"
++            };
++
++            var contactId = Guid.NewGuid();
++            var contact = new Contact
++            {
++                Id = contactId,
++                FirstName = "John",
++                LastName = "Doe",
++                // Contact has attributes that Account doesn't have
++                BirthDate = DateTime.Now.AddYears(-30)
++            };
++
++            // Link account to contact via ParentCustomerId (Contact can have parent account)
++            contact.ParentCustomerId = new EntityReference("account", accountId);
++
++            _context.Initialize(new List<Entity> { account, contact });
++
++            var service = _context.GetOrganizationService();
++
++            // FetchXML with entityname pointing to linked entity alias
++            // The condition filters on contact.birthdate using entityname="linkedContact"
++            // Account doesn't have birthdate attribute - only Contact does
++            var fetchXml = $@"
++                <fetch>
++                    <entity name='account'>
++                        <attribute name='name' />
++                        <filter>
++                            <condition attribute='birthdate' operator='not-null' 
++                                       entityname='linkedContact' />
++                        </filter>
++                        <link-entity name='contact' 
++                                     from='parentcustomerid' 
++                                     to='accountid' 
++                                     alias='linkedContact' 
++                                     link-type='inner'>
++                            <attribute name='firstname' />
++                            <attribute name='birthdate' />
++                        </link-entity>
++                    </entity>
++                </fetch>";
++
++            // This should succeed - the entityname="linkedContact" means check linkedContact.birthdate
++            // NOT account.birthdate. Account doesn't need to have the birthdate attribute.
++            var result = service.RetrieveMultiple(new FetchExpression(fetchXml));
++
++            Assert.Single(result.Entities);
++            Assert.Equal(accountId, result.Entities[0].Id);
++        }
++
++        /// <summary>
++        /// Test with entityname referencing entity name directly (not alias)
++        /// This is an existing supported scenario that should continue to work
++        /// </summary>
++        [Fact]
++        public void FetchXml_WithEntityNameNoAlias_ShouldWork()
++        {
++            _context.EnableProxyTypes(Assembly.GetAssembly(typeof(Contact)));
++
++            var accountId = Guid.NewGuid();
++            var account = new Account
++            {
++                Id = accountId,
++                Name = "Test Account"
++            };
++
++            var contactId = Guid.NewGuid();
++            var contact = new Contact
++            {
++                Id = contactId,
++                FirstName = "John",
++                LastName = "Doe",
++                BirthDate = DateTime.Now.AddYears(-30),
++                ParentCustomerId = new EntityReference("account", accountId)
++            };
++
++            _context.Initialize(new List<Entity> { account, contact });
++
++            var service = _context.GetOrganizationService();
++
++            // FetchXML with entityname pointing to entity name (not alias)
++            var fetchXml = $@"
++                <fetch>
++                    <entity name='account'>
++                        <attribute name='name' />
++                        <filter>
++                            <condition attribute='birthdate' operator='not-null' 
++                                       entityname='contact' />
++                        </filter>
++                        <link-entity name='contact' 
++                                     from='parentcustomerid' 
++                                     to='accountid' 
++                                     link-type='inner'>
++                            <attribute name='firstname' />
++                            <attribute name='birthdate' />
++                        </link-entity>
++                    </entity>
++                </fetch>";
++
++            var result = service.RetrieveMultiple(new FetchExpression(fetchXml));
++
++            Assert.Single(result.Entities);
++            Assert.Equal(accountId, result.Entities[0].Id);
++        }
++    }
++}
+-- 
+2.52.0
+
